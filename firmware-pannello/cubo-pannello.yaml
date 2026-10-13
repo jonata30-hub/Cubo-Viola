@@ -1,0 +1,1390 @@
+# PANNELLO DEL CUBO DI VIOLA - Waveshare ESP32-S3-Touch-LCD-4 (rev 4.0), ESPHome 2026.9.x
+# Solo schermo e tocco: l'audio e' del Voice PE. Il pannello NON conosce i nomi delle entita' di Home Assistant:
+# HA gli parla con poche azioni (pannello_messaggio, pannello_risposta, pannello_squilla, pannello_in_chiamata,
+# pannello_sveglia, pannello_chiudi) e lui risponde con UN evento (esphome.banco_pannello).
+# Funzioni: orologio con nome della stanza e temperature, non disturbare, oscuramento notturno, messaggi fra stanze
+# con conferma di lettura, chiamate fra stanze, pagina musica con copertina (Music Assistant), timer del Voice PE,
+# sveglia, menu impostazioni con pressione lunga.
+# ATTENZIONE, prima di usarlo in casa: qui non ci sono cifratura dell'API ne' password OTA, e se perde la rete il
+# pannello apre un access point senza password. Aggiungi `api: encryption:`, `ota: password:` e `wifi: ap: password:`.
+# Il Wi-Fi si configura al primo avvio con improv (USB): nel file non ci sono credenziali.
+# Stato: prototipo da banco. Le sostituzioni qui sotto vanno adattate alla tua casa.
+substitutions:
+  nome: cubo-pannello-1          # secondo pannello: cubo-pannello-2
+  etichetta: "Pannello 1"
+  pe_associato: camera                # a quale PE appartiene: viaggia nell'evento verso HA
+  postazione: "Camera"                # v5: nome scritto in alto sull'orologio
+  sensore_temperatura: sensor.temperatura_da_definire   # v5: SEGNAPOSTO. Finche' l'entita' non esiste, a schermo «--,- °C»
+  ora_notte: "22"                     # v6: dalle 22 ...
+  ora_giorno: "7"                     # ... alle 7 lo schermo dell'orologio si abbassa (se «Oscuramento notturno» e' acceso)
+  luce_notte: "0.08"                  # v6: luminosita' di notte (0-1)
+  lettore_musica: media_player.musica_camera        # lettore di Music Assistant del cubo
+  altra_stanza: "Cucina"              # v7: il tasto «Chiama ...» del menu
+  altra_pe: cucina                    # v7: ... e il PE da chiamare (viaggia nell'evento `chiama`)
+  versione: "v9d del 11/10/2026"
+  ha_url: "http://homeassistant.local:8123"       # indirizzo di Home Assistant visto dal pannello (per scaricare la copertina)
+  sensore_esterno: sensor.temperatura_esterna_da_definire   # v8: SEGNAPOSTO 
+  sensore_timer: sensor.pe_camera_timer_secondi   # v8 (v9b: nome vero)
+  sveglia_ora: input_datetime.sveglia_camera                # v8: aiutanti di HA da creare (ora sola, senza data)
+  sveglia_attiva: input_boolean.sveglia_camera
+
+esphome:
+  name: ${nome}
+  friendly_name: ${etichetta}
+  on_boot:
+    - priority: 600
+      then:
+        - switch.turn_off: cicalino    # senza questo il cicalino resta acceso dopo l'avvio (problema noto della rev 4.0)
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO           # v3: log normale (DEBUG servi solo alla prima prova)
+
+api:
+  actions:
+    - action: pannello_messaggio
+      variables: {mittente: string, testo: string, secondi: int}
+      then:
+        - lambda: |-
+            id(msg_mittente) = mittente; id(msg_testo) = testo; id(msg_risposta) = false; id(non_letto) = true;
+            id(torna_all_orologio).stop();
+            id(torna_all_orologio).execute((int) secondi);
+        - display.page.show: pagina_messaggio
+        - component.update: lcd
+        - script.execute: aggiorna_luce
+    - action: pannello_risposta        # v4: stessa pagina, ma il tocco NON dice «ha letto» a nessuno
+      variables: {mittente: string, testo: string, secondi: int}
+      then:
+        - lambda: |-
+            id(msg_mittente) = mittente; id(msg_testo) = testo; id(msg_risposta) = true;
+            id(torna_all_orologio).stop();
+            id(torna_all_orologio).execute((int) secondi);
+        - display.page.show: pagina_messaggio
+        - component.update: lcd
+        - script.execute: aggiorna_luce
+    - action: pannello_squilla
+      variables: {chiamante: string, secondi: int}
+      then:
+        - if:                              # v6: con Non disturbare acceso lo squillo non si mostra (HA lo sa dall'entita')
+            condition: {switch.is_on: non_disturbare}
+            then: [lambda: 'ESP_LOGI("pannello", "squillo ignorato: non disturbare");']
+            else:
+              - lambda: 'id(chi_chiama) = chiamante;'
+              - display.page.show: pagina_chiamata
+              - component.update: lcd
+              - script.execute: aggiorna_luce
+              - script.stop: torna_all_orologio
+              - if:
+                  condition: {switch.is_on: cicalino_nello_squillo}
+                  then: [script.execute: squillo]
+              - script.execute:
+                  id: torna_all_orologio
+                  secondi: !lambda 'return secondi;'
+    - action: pannello_in_chiamata     # v8: HA la chiama sul pannello di chi ha CHIAMATO quando l'altro accetta
+      variables: {con: string}
+      then:
+        - lambda: 'id(chi_chiama) = con; id(inizio_chiamata) = millis();'
+        - script.stop: torna_all_orologio
+        - script.stop: squillo
+        - switch.turn_off: cicalino
+        - display.page.show: pagina_in_chiamata
+        - component.update: lcd
+        - script.execute: aggiorna_luce
+    - action: pannello_sveglia          # v8: HA la chiama quando la sveglia suona
+      then:
+        - script.stop: torna_all_orologio
+        - display.page.show: pagina_sveglia_suona
+        - component.update: lcd
+        - script.execute: aggiorna_luce
+        - script.execute: {id: torna_all_orologio, secondi: 600}
+    - action: pannello_chiudi
+      then:
+        - script.stop: squillo
+        - switch.turn_off: cicalino
+        - display.page.show: pagina_orologio
+        - component.update: lcd
+
+ota:
+  - platform: esphome
+
+wifi:
+  ap: {}                                # nessuna credenziale nel file: si configura con improv USB / portale
+improv_serial:
+captive_portal:
+
+i2c:
+  - id: bus_a
+    sda: GPIO15
+    scl: GPIO7
+    frequency: 400kHz
+    scan: true
+
+spi:
+  - id: spi_lcd
+    clk_pin: GPIO2
+    mosi_pin: GPIO1
+
+waveshare_io_ch32v003:
+  - id: espansore
+    address: 0x24
+    i2c_id: bus_a
+
+output:
+  - platform: waveshare_io_ch32v003
+    id: pwm_retro
+    waveshare_io_ch32v003_id: espansore
+    inverted: true
+    zero_means_zero: true
+    safe_pwm_levels: {min_value: 0, max_value: 247}
+
+light:
+  - platform: monochromatic
+    name: "Retroilluminazione"
+    id: retro
+    output: pwm_retro
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+switch:
+  - platform: template
+    id: non_disturbare
+    name: "Non disturbare"
+    icon: mdi:minus-circle
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on: [component.update: lcd]
+    on_turn_off: [component.update: lcd]
+  - platform: template
+    id: oscuramento_notturno
+    name: "Oscuramento notturno"
+    icon: mdi:weather-night
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on: [script.execute: aggiorna_luce]
+    on_turn_off: [script.execute: aggiorna_luce]
+  - platform: template
+    id: cicalino_nello_squillo
+    name: "Cicalino nello squillo"
+    icon: mdi:bell-ring
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: gpio
+    id: cicalino
+    name: "Cicalino"
+    pin: {waveshare_io_ch32v003: espansore, number: 6, mode: {output: true}, inverted: false}
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+display:
+  - platform: mipi_rgb
+    model: WAVESHARE-4-480X480
+    id: lcd
+    reset_pin: {waveshare_io_ch32v003: espansore, number: 3}
+    pixel_mode: 18bit
+    update_interval: 10s   # v2: prima 'never' = schermo mai disegnato finche' HA non mandava l'ora (errore del box 08/10)
+    on_page_change:        # v9c: segna il momento del cambio pagina (i tocchi dei 500 ms dopo si ignorano)
+      - lambda: 'id(cambio_ms) = millis();'
+    auto_clear_enabled: true
+    pages:
+      - id: pagina_orologio
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));   // v5: cornice doppia (oro + bruno)
+          it.print(240, 62, id(font_titolo), Color(214,176,104), TextAlign::CENTER, "${postazione}");
+          it.horizontal_line(150, 96, 180, Color(214,176,104));
+          if (id(non_letto)) it.print(55, 62, id(icona_piccola), Color(214,176,104), TextAlign::CENTER, "\U000F01EE");   // v8: busta
+          if (id(non_disturbare).state) it.print(425, 62, id(icona_piccola), Color(200,40,40), TextAlign::CENTER, "\U000F0376");   // v6: DND acceso
+          else it.print(425, 62, id(icona_piccola), Color(90,90,90), TextAlign::CENTER, "\U000F0377");                      // v6: DND spento
+          auto t = id(ora).now();
+          if (t.is_valid()) {
+            it.strftime(240, 215, id(font_grande), Color(255,255,255), TextAlign::CENTER, "%H:%M", t);
+            it.strftime(240, 305, id(font_media), Color(170,170,170), TextAlign::CENTER, "%d/%m/%Y", t);
+          } else {
+            it.print(240, 240, id(font_media), Color(170,170,170), TextAlign::CENTER, "in attesa dell'ora...");
+          }
+          if (id(sveglia_on).state) {                       // v8: sveglia attiva
+            int h = 0, m = 0; sscanf(id(sveglia_ora_ha).state.c_str(), "%d:%d", &h, &m);
+            it.print(212, 341, id(icona_mini), Color(214,176,104), TextAlign::CENTER, "\U000F0020");
+            it.printf(260, 341, id(font_nota), Color(214,176,104), TextAlign::CENTER, "%02d:%02d", h, m);
+          }
+          it.horizontal_line(150, 360, 180, Color(70,70,70));
+          auto gradi = [](float v, char *b, size_t n) {
+            if (std::isnan(v)) snprintf(b, n, "--,-°"); else { snprintf(b, n, "%.1f°", v); for (char *c = b; *c; c++) if (*c == '.') *c = ','; } };
+          char b1[16], b2[16];
+          if (id(timer_stato) == 1) {                       // v8: timer al posto delle temperature
+            int rest = (int) ((int32_t) (id(timer_fine) - millis()) / 1000); if (rest < 0) rest = 0;
+            it.print(180, 410, id(icona_piccola), Color(214,176,104), TextAlign::CENTER, "\U000F051B");
+            if (rest >= 3600) it.printf(265, 410, id(font_media), Color(214,176,104), TextAlign::CENTER, "%d:%02d:%02d", rest / 3600, rest / 60 % 60, rest % 60);
+            else it.printf(265, 410, id(font_media), Color(214,176,104), TextAlign::CENTER, "%02d:%02d", rest / 60, rest % 60);
+          } else if (id(timer_stato) == 2) {
+            it.print(240, 410, id(font_media), Color(230,60,60), TextAlign::CENTER, "Timer finito");
+          } else if (std::isnan(id(temp_esterna).state)) {  // senza esterno: come la v5
+            gradi(id(temp_stanza).state, b1, sizeof(b1));
+            it.printf(240, 410, id(font_media), Color(255,255,255), TextAlign::CENTER, "%sC", b1);
+          } else {                                           // v8: stanza | fuori
+            gradi(id(temp_stanza).state, b1, sizeof(b1)); gradi(id(temp_esterna).state, b2, sizeof(b2));
+            it.print(150, 398, id(font_media), Color(255,255,255), TextAlign::CENTER, b1);
+            it.print(330, 398, id(font_media), Color(255,255,255), TextAlign::CENTER, b2);
+            it.print(150, 438, id(font_nota), Color(140,140,140), TextAlign::CENTER, "stanza");
+            it.print(330, 438, id(font_nota), Color(140,140,140), TextAlign::CENTER, "fuori");
+            it.vertical_line(240, 380, 70, Color(70,70,70));
+          }
+      - id: pagina_messaggio
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));   // v5: cornice doppia (oro + bruno)
+          it.print(240, 70, id(font_bottone), Color(255,190,0), TextAlign::CENTER, id(msg_mittente).c_str());
+          // il testo va a capo da solo ogni ~26 caratteri
+          std::string r = id(msg_testo); int y = 150; size_t i = 0;
+          while (i < r.size() && y < 400) {   // v4: sotto i 400 c'e' la riga dell'invito
+            size_t n = std::min<size_t>(22, r.size() - i);   // v5: Montserrat e' piu' largo di Roboto
+            if (i + n < r.size()) { size_t sp = r.rfind(' ', i + n); if (sp != std::string::npos && sp > i) n = sp - i; }
+            it.print(240, y, id(font_piccola), Color(255,255,255), TextAlign::CENTER, r.substr(i, n).c_str());
+            i += n; while (i < r.size() && r[i] == ' ') i++; y += 40;
+          }
+          it.print(240, 436, id(font_nota), Color(140,140,140), TextAlign::CENTER,
+                   id(msg_risposta) ? "Tocca per chiudere" : "Tocca per confermare la lettura");
+      - id: pagina_musica             # v7
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));
+          it.print(240, 62, id(font_titolo), Color(214,176,104), TextAlign::CENTER, "${postazione}");
+          it.horizontal_line(150, 96, 180, Color(214,176,104));
+          bool suona = id(mus_stato).state == "playing";
+          if (!id(cop_ok)) it.print(240, 122, id(font_nota), Color(140,140,140), TextAlign::CENTER, suona ? "In riproduzione" : "In pausa");
+          auto corto = [](std::string x, size_t n) { return x.size() > n ? x.substr(0, n - 1) + "..." : x; };
+          float v = id(mus_volume).state;
+          if (id(cop_ok)) {                                   // v9: copertina a sinistra, testi a destra
+            it.image(40, 112, id(copertina));
+            it.rectangle(39, 111, 152, 152, Color(90,72,40));
+            std::string tt = id(mus_titolo).state; int y = 120;
+            for (int riga = 0; riga < 2 && !tt.empty(); riga++) {
+              size_t n = std::min<size_t>(13, tt.size());
+              if (n < tt.size()) { size_t sp = tt.rfind(' ', n); if (sp != std::string::npos && sp > 0) n = sp; }
+              std::string pezzo = tt.substr(0, n); tt = tt.substr(std::min(n + 1, tt.size()));
+              if (riga == 1 && !tt.empty()) pezzo = corto(pezzo + " " + tt, 13);
+              it.print(205, y, id(font_bottone), Color(255,255,255), TextAlign::TOP_LEFT, pezzo.c_str()); y += 40;
+            }
+            it.print(205, y + 4, id(font_nota), Color(170,170,170), TextAlign::TOP_LEFT, corto(id(mus_artista).state, 16).c_str());
+            if (!std::isnan(v)) it.printf(205, 236, id(font_nota), Color(140,140,140), TextAlign::TOP_LEFT, "Volume %d%%", (int) (v * 100 + 0.5f));
+          } else {                                            // come la v8
+            it.print(240, 172, id(font_bottone), Color(255,255,255), TextAlign::CENTER, corto(id(mus_titolo).state, 22).c_str());
+            it.print(240, 218, id(font_piccola), Color(170,170,170), TextAlign::CENTER, corto(id(mus_artista).state, 24).c_str());
+            if (!std::isnan(v)) it.printf(240, 262, id(font_nota), Color(140,140,140), TextAlign::CENTER, "Volume %d%%", (int) (v * 100 + 0.5f));
+          }
+          if (id(g_lampo) >= 14 && id(g_lampo) <= 16) { int cx = id(g_lampo) == 14 ? 100 : id(g_lampo) == 15 ? 240 : 380; it.filled_rectangle(cx - 60, 300, 120, 80, Color(90,72,40)); }
+          if (id(g_lampo) == 17) it.filled_rectangle(30, 395, 200, 60, Color(90,72,40));
+          if (id(g_lampo) == 18) it.filled_rectangle(250, 395, 200, 60, Color(90,72,40));
+          it.print(100, 340, id(icona_grande), Color(214,176,104), TextAlign::CENTER, "\U000F04AE");
+          it.print(240, 340, id(icona_grande), Color(214,176,104), TextAlign::CENTER, suona ? "\U000F03E4" : "\U000F040A");
+          it.print(380, 340, id(icona_grande), Color(214,176,104), TextAlign::CENTER, "\U000F04AD");
+          it.rectangle(30, 395, 200, 60, Color(90,72,40)); it.rectangle(250, 395, 200, 60, Color(90,72,40));
+          it.print(130, 425, id(icona_piccola), Color(255,255,255), TextAlign::CENTER, "\U000F075E");
+          it.print(350, 425, id(icona_piccola), Color(255,255,255), TextAlign::CENTER, "\U000F075D");
+      - id: pagina_menu               # v7: pressione lunga sul nome della stanza
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));
+          it.print(240, 52, id(font_titolo), Color(214,176,104), TextAlign::CENTER, "Impostazioni");
+          auto tasto = [&](int x, int y, const char *t, int n) {
+            bool l = id(g_lampo) == n;
+            int w = n == 8 ? 420 : 200;
+            it.filled_rectangle(x, y, w, 54, l ? Color(214,176,104) : Color(35,30,22)); it.rectangle(x, y, w, 54, Color(214,176,104));
+            it.print(x + w / 2, y + 27, id(font_nota), l ? Color(0,0,0) : Color(255,255,255), TextAlign::CENTER, t); };
+          char luce[48]; float vv = id(mus_volume).state;
+          if (std::isnan(vv)) snprintf(luce, sizeof(luce), "Luce %d%%", (int) (id(g_luce_giorno) * 100 + 0.5f));
+          else snprintf(luce, sizeof(luce), "Luce %d%%  ·  Volume %d%%", (int) (id(g_luce_giorno) * 100 + 0.5f), (int) (vv * 100 + 0.5f));
+          // v8: cinque righe di tasti alti 54 (era 4 da 70) per fare posto alla Sveglia
+          it.print(240, 98, id(font_nota), Color(140,140,140), TextAlign::CENTER, luce);
+          tasto(30, 115, "Luce -", 1);         tasto(250, 115, "Luce +", 2);
+          tasto(30, 175, "Volume -", 3);       tasto(250, 175, "Volume +", 4);
+          tasto(30, 235, "Notte", 5);          tasto(250, 235, "Sveglia", 9);
+          tasto(30, 295, id(cicalino_nello_squillo).state ? "Cicalino: sì" : "Cicalino: no", 6);
+          tasto(250, 295, "Chiama ${altra_stanza}", 7);
+          tasto(30, 355, "Informazioni", 8);
+          it.print(240, 443, id(font_bottone), Color(214,176,104), TextAlign::CENTER, "Esci");
+      - id: pagina_notte              # v7
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));
+          it.print(240, 62, id(font_titolo), Color(214,176,104), TextAlign::CENTER, "Notte");
+          it.filled_rectangle(30, 115, 420, 70, id(g_lampo) == 9 ? Color(90,72,40) : Color(35,30,22)); it.rectangle(30, 115, 420, 70, Color(214,176,104));
+          it.print(240, 150, id(font_nota), Color(255,255,255), TextAlign::CENTER,
+                   id(oscuramento_notturno).state ? "Oscuramento notturno: sì" : "Oscuramento notturno: no");
+          auto riga = [&](int y, const char *etichetta, int ore, int n) {
+            if (id(g_lampo) == n) it.filled_rectangle(30, y, 90, 70, Color(90,72,40));
+            if (id(g_lampo) == n + 1) it.filled_rectangle(360, y, 90, 70, Color(90,72,40));
+            it.rectangle(30, y, 90, 70, Color(214,176,104)); it.rectangle(360, y, 90, 70, Color(214,176,104));
+            it.print(75, y + 35, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "-");
+            it.print(405, y + 35, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "+");
+            it.printf(240, y + 35, id(font_piccola), Color(255,255,255), TextAlign::CENTER, "%s %02d:00", etichetta, ore); };
+          riga(205, "Inizio", id(g_ora_notte), 10);
+          riga(295, "Fine", id(g_ora_giorno), 12);
+          it.print(240, 443, id(font_nota), Color(214,176,104), TextAlign::CENTER, "Indietro");
+      - id: pagina_info               # v7
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));
+          it.print(240, 62, id(font_titolo), Color(214,176,104), TextAlign::CENTER, "Informazioni");
+          int y = 130; auto riga = [&](const char *t) { it.print(240, y, id(font_nota), Color(255,255,255), TextAlign::CENTER, t); y += 42; };
+          char b[48];
+          float w = id(segnale).state;
+          if (std::isnan(w)) snprintf(b, sizeof(b), "Wi-Fi: --"); else snprintf(b, sizeof(b), "Wi-Fi: %d dBm", (int) w); riga(b);
+          snprintf(b, sizeof(b), "IP: %s", id(mio_ip).state.c_str()); riga(b);
+          riga("Versione: ${versione}");
+          snprintf(b, sizeof(b), "Notte: %02d-%02d (%s)", id(g_ora_notte), id(g_ora_giorno), id(oscuramento_notturno).state ? "sì" : "no"); riga(b);
+          snprintf(b, sizeof(b), "Non disturbare: %s", id(non_disturbare).state ? "sì" : "no"); riga(b);
+          snprintf(b, sizeof(b), "Cubo: ${pe_associato}"); riga(b);
+          it.print(240, 443, id(font_nota), Color(214,176,104), TextAlign::CENTER, "Indietro");
+      - id: pagina_in_chiamata        # v8
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));
+          it.print(240, 70, id(font_media), Color(170,170,170), TextAlign::CENTER, "In chiamata con");
+          it.print(240, 145, id(font_grande_nome), Color(214,176,104), TextAlign::CENTER, id(chi_chiama).c_str());
+          uint32_t sec = (millis() - id(inizio_chiamata)) / 1000;
+          it.print(190, 235, id(icona_telefono), Color(214,176,104), TextAlign::CENTER, "\U000F03F6");
+          it.printf(290, 235, id(font_media), Color(255,255,255), TextAlign::CENTER, "%02u:%02u", (unsigned) (sec / 60), (unsigned) (sec % 60));
+          bool l = id(g_lampo) == 20;
+          it.filled_rectangle(30, 300, 420, 140, l ? Color(255,90,90) : Color(170, 0, 0));
+          it.print(240, 342, id(icona_telefono), Color(255,255,255), TextAlign::CENTER, "\U000F03F5");
+          it.print(240, 410, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "RIAGGANCIA");
+      - id: pagina_sveglia            # v8: regolazione dal menu
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));
+          it.print(240, 62, id(font_titolo), Color(214,176,104), TextAlign::CENTER, "Sveglia");
+          it.filled_rectangle(30, 115, 420, 70, id(g_lampo) == 30 ? Color(90,72,40) : Color(35,30,22)); it.rectangle(30, 115, 420, 70, Color(214,176,104));
+          it.print(240, 150, id(font_nota), Color(255,255,255), TextAlign::CENTER, id(sveglia_on).state ? "Sveglia: attiva" : "Sveglia: spenta");
+          int h = 7, m = 0; sscanf(id(sveglia_ora_ha).state.c_str(), "%d:%d", &h, &m);
+          auto riga = [&](int y, const char *etichetta, int val, int n) {
+            if (id(g_lampo) == n) it.filled_rectangle(30, y, 90, 70, Color(90,72,40));
+            if (id(g_lampo) == n + 1) it.filled_rectangle(360, y, 90, 70, Color(90,72,40));
+            it.rectangle(30, y, 90, 70, Color(214,176,104)); it.rectangle(360, y, 90, 70, Color(214,176,104));
+            it.print(75, y + 35, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "-");
+            it.print(405, y + 35, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "+");
+            it.printf(240, y + 35, id(font_piccola), Color(255,255,255), TextAlign::CENTER, "%s %02d", etichetta, val); };
+          riga(205, "Ore", h, 31);
+          riga(295, "Minuti", m, 33);
+          it.print(240, 443, id(font_nota), Color(214,176,104), TextAlign::CENTER, "Indietro");
+      - id: pagina_sveglia_suona      # v8: la sveglia sta suonando
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));
+          it.print(240, 70, id(font_media), Color(170,170,170), TextAlign::CENTER, "Sveglia");
+          auto t = id(ora).now();
+          if (t.is_valid()) it.strftime(240, 165, id(font_grande), Color(214,176,104), TextAlign::CENTER, "%H:%M", t);
+          it.filled_rectangle(30, 300, 200, 140, id(g_lampo) == 35 ? Color(240,210,140) : Color(214,176,104));
+          it.print(130, 370, id(font_bottone), Color(0,0,0), TextAlign::CENTER, "SPEGNI");
+          it.filled_rectangle(250, 300, 200, 140, id(g_lampo) == 36 ? Color(90,90,90) : Color(50,50,50));
+          it.print(350, 370, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "+10 min");
+      - id: pagina_chiamata
+        lambda: |-
+          it.fill(Color(0, 0, 0));
+          it.rectangle(10, 10, 460, 460, Color(214,176,104)); it.rectangle(11, 11, 458, 458, Color(214,176,104));
+          it.rectangle(18, 18, 444, 444, Color(90,72,40));   // v5: cornice doppia (oro + bruno)
+          it.print(240, 70, id(font_media), Color(170,170,170), TextAlign::CENTER, "Chiamata da");
+          it.print(240, 145, id(font_grande_nome), Color(214,176,104), TextAlign::CENTER, id(chi_chiama).c_str());   // v5b: oro come i titoli
+          it.print(240, 235, id(icona_telefono), Color(214,176,104), TextAlign::CENTER, "\U000F11AB");              // v5b: telefono che squilla (mdi-phone-ring)
+          it.filled_rectangle(30, 300, 200, 140, Color(0, 150, 0));
+          it.print(130, 370, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "ACCETTA");
+          it.filled_rectangle(250, 300, 200, 140, Color(170, 0, 0));
+          it.print(350, 370, id(font_bottone), Color(255,255,255), TextAlign::CENTER, "RIFIUTA");
+
+touchscreen:
+  - platform: gt911
+    id: tocco
+    i2c_id: bus_a
+    display: lcd
+    update_interval: 20ms
+    reset_pin: {waveshare_io_ch32v003: espansore, number: 1}
+    interrupt_pin: {waveshare_io_ch32v003: espansore, number: 2}   # dietro l'espansore: ESPHome lo legge a intervalli
+    # nessuna trasformazione: se l'orientamento e' sbagliato si regola sulla scheda vera (VERIFICARE)
+
+binary_sensor:
+  - platform: homeassistant         # v8: sveglia attiva?
+    id: sveglia_on
+    entity_id: ${sveglia_attiva}
+    internal: true
+    on_state: [component.update: lcd]
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Tasto Accetta"
+    internal: true
+    page_id: pagina_chiamata
+    x_min: 30
+    x_max: 230
+    y_min: 300
+    y_max: 440
+    on_press:
+      - script.stop: squillo
+      - switch.turn_off: cicalino
+      - homeassistant.event:
+          event: esphome.banco_pannello
+          data:
+            pannello: "${nome}"
+            pe: "${pe_associato}"
+            azione: accetta
+      - lambda: 'id(inizio_chiamata) = millis();'
+      - script.stop: torna_all_orologio
+      - display.page.show: pagina_in_chiamata      # v8: si resta qui finche' qualcuno riaggancia
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Tasto Rifiuta"
+    internal: true
+    page_id: pagina_chiamata
+    x_min: 250
+    x_max: 450
+    y_min: 300
+    y_max: 440
+    on_press:
+      - script.stop: squillo
+      - switch.turn_off: cicalino
+      - homeassistant.event:
+          event: esphome.banco_pannello
+          data:
+            pannello: "${nome}"
+            pe: "${pe_associato}"
+            azione: rifiuta
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Tasto non disturbare"
+    internal: true
+    page_id: pagina_orologio
+    x_min: 370
+    x_max: 479
+    y_min: 0
+    y_max: 120
+    on_press:
+      - switch.toggle: non_disturbare
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Tocco orologio"
+    internal: true
+    page_id: pagina_orologio
+    x_min: 0
+    x_max: 479
+    y_min: 0
+    y_max: 479
+    on_press:
+      - script.execute: sveglia
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Nome stanza (pressione lunga)"
+    internal: true
+    page_id: pagina_orologio
+    x_min: 120
+    x_max: 360
+    y_min: 20
+    y_max: 110
+    on_press: [script.execute: pressione_lunga]
+    on_release: [script.stop: pressione_lunga]
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Tocco centro orologio"
+    internal: true
+    page_id: pagina_orologio
+    x_min: 0
+    x_max: 479
+    y_min: 120
+    y_max: 479
+    on_press:
+      - if:
+          condition: {lambda: 'return id(mus_stato).state == "playing" || id(mus_stato).state == "paused";'}
+          then: [display.page.show: pagina_musica, component.update: lcd]
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Musica: torna all'orologio"
+    internal: true
+    page_id: pagina_musica
+    x_min: 0
+    x_max: 479
+    y_min: 0
+    y_max: 110
+    on_press:
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+      - script.execute: aggiorna_luce
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Musica: precedente"
+    internal: true
+    page_id: pagina_musica
+    x_min: 30
+    x_max: 170
+    y_min: 295
+    y_max: 385
+    on_press:
+      - script.execute: {id: lampo, n: 14}
+      - homeassistant.action:
+          action: media_player.media_previous_track
+          data:
+            entity_id: ${lettore_musica}
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Musica: pausa e play"
+    internal: true
+    page_id: pagina_musica
+    x_min: 170
+    x_max: 310
+    y_min: 295
+    y_max: 385
+    on_press:
+      - script.execute: {id: lampo, n: 15}
+      - homeassistant.action:
+          action: media_player.media_play_pause
+          data:
+            entity_id: ${lettore_musica}
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Musica: successivo"
+    internal: true
+    page_id: pagina_musica
+    x_min: 310
+    x_max: 450
+    y_min: 295
+    y_max: 385
+    on_press:
+      - script.execute: {id: lampo, n: 16}
+      - homeassistant.action:
+          action: media_player.media_next_track
+          data:
+            entity_id: ${lettore_musica}
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Musica: volume -"
+    internal: true
+    page_id: pagina_musica
+    x_min: 30
+    x_max: 230
+    y_min: 395
+    y_max: 455
+    on_press:
+      - script.execute: {id: lampo, n: 17}
+      - homeassistant.action:
+          action: media_player.volume_down
+          data:
+            entity_id: ${lettore_musica}
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Musica: volume +"
+    internal: true
+    page_id: pagina_musica
+    x_min: 250
+    x_max: 450
+    y_min: 395
+    y_max: 455
+    on_press:
+      - script.execute: {id: lampo, n: 18}
+      - homeassistant.action:
+          action: media_player.volume_up
+          data:
+            entity_id: ${lettore_musica}
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: luce -"
+    internal: true
+    page_id: pagina_menu
+    x_min: 30
+    x_max: 230
+    y_min: 115
+    y_max: 169
+    on_press:
+      - script.execute: {id: lampo, n: 1}
+      - lambda: 'id(g_luce_giorno) = std::max(0.2f, id(g_luce_giorno) - 0.2f);'
+      - script.execute: aggiorna_luce
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: luce +"
+    internal: true
+    page_id: pagina_menu
+    x_min: 250
+    x_max: 450
+    y_min: 115
+    y_max: 169
+    on_press:
+      - script.execute: {id: lampo, n: 2}
+      - lambda: 'id(g_luce_giorno) = std::min(1.0f, id(g_luce_giorno) + 0.2f);'
+      - script.execute: aggiorna_luce
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: volume -"
+    internal: true
+    page_id: pagina_menu
+    x_min: 30
+    x_max: 230
+    y_min: 175
+    y_max: 229
+    on_press:
+      - script.execute: {id: lampo, n: 3}
+      - homeassistant.action:
+          action: media_player.volume_down
+          data:
+            entity_id: ${lettore_musica}
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: volume +"
+    internal: true
+    page_id: pagina_menu
+    x_min: 250
+    x_max: 450
+    y_min: 175
+    y_max: 229
+    on_press:
+      - script.execute: {id: lampo, n: 4}
+      - homeassistant.action:
+          action: media_player.volume_up
+          data:
+            entity_id: ${lettore_musica}
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: notte"
+    internal: true
+    page_id: pagina_menu
+    x_min: 30
+    x_max: 230
+    y_min: 235
+    y_max: 289
+    on_press:
+      - script.execute: {id: lampo, n: 5}
+      - display.page.show: pagina_notte
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: cicalino"
+    internal: true
+    page_id: pagina_menu
+    x_min: 30
+    x_max: 230
+    y_min: 295
+    y_max: 349
+    on_press:
+      - script.execute: {id: lampo, n: 6}
+      - switch.toggle: cicalino_nello_squillo
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: chiama"
+    internal: true
+    page_id: pagina_menu
+    x_min: 250
+    x_max: 450
+    y_min: 295
+    y_max: 349
+    on_press:
+      - script.execute: {id: lampo, n: 7}
+      - homeassistant.event:
+          event: esphome.banco_pannello
+          data:
+            pannello: "${nome}"
+            pe: "${pe_associato}"
+            azione: chiama
+            a: "${altra_pe}"
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: informazioni"
+    internal: true
+    page_id: pagina_menu
+    x_min: 30
+    x_max: 450
+    y_min: 355
+    y_max: 409
+    on_press:
+      - script.execute: {id: lampo, n: 8}
+      - display.page.show: pagina_info
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: esci"
+    internal: true
+    page_id: pagina_menu
+    x_min: 0
+    x_max: 479
+    y_min: 430
+    y_max: 479
+    on_press:
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+      - script.execute: sveglia
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Notte: acceso o spento"
+    internal: true
+    page_id: pagina_notte
+    x_min: 30
+    x_max: 450
+    y_min: 115
+    y_max: 185
+    on_press:
+      - script.execute: {id: lampo, n: 9}
+      - switch.toggle: oscuramento_notturno
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Notte: inizio -"
+    internal: true
+    page_id: pagina_notte
+    x_min: 30
+    x_max: 120
+    y_min: 205
+    y_max: 275
+    on_press:
+      - script.execute: {id: lampo, n: 10}
+      - lambda: 'id(g_ora_notte) = (id(g_ora_notte) + 23) % 24;'
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Notte: inizio +"
+    internal: true
+    page_id: pagina_notte
+    x_min: 360
+    x_max: 450
+    y_min: 205
+    y_max: 275
+    on_press:
+      - script.execute: {id: lampo, n: 11}
+      - lambda: 'id(g_ora_notte) = (id(g_ora_notte) + 1) % 24;'
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Notte: fine -"
+    internal: true
+    page_id: pagina_notte
+    x_min: 30
+    x_max: 120
+    y_min: 295
+    y_max: 365
+    on_press:
+      - script.execute: {id: lampo, n: 12}
+      - lambda: 'id(g_ora_giorno) = (id(g_ora_giorno) + 23) % 24;'
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Notte: fine +"
+    internal: true
+    page_id: pagina_notte
+    x_min: 360
+    x_max: 450
+    y_min: 295
+    y_max: 365
+    on_press:
+      - script.execute: {id: lampo, n: 13}
+      - lambda: 'id(g_ora_giorno) = (id(g_ora_giorno) + 1) % 24;'
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Notte: indietro"
+    internal: true
+    page_id: pagina_notte
+    x_min: 0
+    x_max: 479
+    y_min: 430
+    y_max: 479
+    on_press:
+      - display.page.show: pagina_menu
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Info: indietro"
+    internal: true
+    page_id: pagina_info
+    x_min: 0
+    x_max: 479
+    y_min: 0
+    y_max: 479
+    on_press:
+      - display.page.show: pagina_menu
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Tasto riaggancia"
+    internal: true
+    page_id: pagina_in_chiamata
+    x_min: 30
+    x_max: 450
+    y_min: 300
+    y_max: 440
+    on_press:
+      - script.execute: {id: lampo, n: 20}
+      - homeassistant.event:
+          event: esphome.banco_pannello
+          data:
+            pannello: "${nome}"
+            pe: "${pe_associato}"
+            azione: riaggancia
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Busta messaggi"
+    internal: true
+    page_id: pagina_orologio
+    x_min: 18
+    x_max: 110
+    y_min: 18
+    y_max: 110
+    on_press:
+      - if:
+          condition: {lambda: 'return id(non_letto);'}
+          then:
+            - display.page.show: pagina_messaggio
+            - component.update: lcd
+            - script.execute: {id: torna_all_orologio, secondi: 60}
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Menu: sveglia"
+    internal: true
+    page_id: pagina_menu
+    x_min: 250
+    x_max: 450
+    y_min: 235
+    y_max: 289
+    on_press:
+      - script.execute: {id: lampo, n: 9}
+      - display.page.show: pagina_sveglia
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: attiva o spenta"
+    internal: true
+    page_id: pagina_sveglia
+    x_min: 30
+    x_max: 450
+    y_min: 115
+    y_max: 185
+    on_press:
+      - script.execute: {id: lampo, n: 30}
+      - homeassistant.action:
+          action: input_boolean.toggle
+          data:
+            entity_id: ${sveglia_attiva}
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: ore -"
+    internal: true
+    page_id: pagina_sveglia
+    x_min: 30
+    x_max: 120
+    y_min: 205
+    y_max: 275
+    on_press:
+      - script.execute: {id: lampo, n: 31}
+      - homeassistant.action:
+          action: input_datetime.set_datetime
+          data:
+            entity_id: ${sveglia_ora}
+          data_template:
+            time: "{{ ora }}"
+          variables:
+            ora: !lambda |-
+              int h = 7, m = 0; sscanf(id(sveglia_ora_ha).state.c_str(), "%d:%d", &h, &m);
+              h = (h + 23) % 24;
+              char b[12]; snprintf(b, sizeof(b), "%02d:%02d:00", h, m); return std::string(b);
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: ore +"
+    internal: true
+    page_id: pagina_sveglia
+    x_min: 360
+    x_max: 450
+    y_min: 205
+    y_max: 275
+    on_press:
+      - script.execute: {id: lampo, n: 32}
+      - homeassistant.action:
+          action: input_datetime.set_datetime
+          data:
+            entity_id: ${sveglia_ora}
+          data_template:
+            time: "{{ ora }}"
+          variables:
+            ora: !lambda |-
+              int h = 7, m = 0; sscanf(id(sveglia_ora_ha).state.c_str(), "%d:%d", &h, &m);
+              h = (h + 1) % 24;
+              char b[12]; snprintf(b, sizeof(b), "%02d:%02d:00", h, m); return std::string(b);
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: minuti -"
+    internal: true
+    page_id: pagina_sveglia
+    x_min: 30
+    x_max: 120
+    y_min: 295
+    y_max: 365
+    on_press:
+      - script.execute: {id: lampo, n: 33}
+      - homeassistant.action:
+          action: input_datetime.set_datetime
+          data:
+            entity_id: ${sveglia_ora}
+          data_template:
+            time: "{{ ora }}"
+          variables:
+            ora: !lambda |-
+              int h = 7, m = 0; sscanf(id(sveglia_ora_ha).state.c_str(), "%d:%d", &h, &m);
+              m = (m + 55) % 60;
+              char b[12]; snprintf(b, sizeof(b), "%02d:%02d:00", h, m); return std::string(b);
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: minuti +"
+    internal: true
+    page_id: pagina_sveglia
+    x_min: 360
+    x_max: 450
+    y_min: 295
+    y_max: 365
+    on_press:
+      - script.execute: {id: lampo, n: 34}
+      - homeassistant.action:
+          action: input_datetime.set_datetime
+          data:
+            entity_id: ${sveglia_ora}
+          data_template:
+            time: "{{ ora }}"
+          variables:
+            ora: !lambda |-
+              int h = 7, m = 0; sscanf(id(sveglia_ora_ha).state.c_str(), "%d:%d", &h, &m);
+              m = (m + 5) % 60;
+              char b[12]; snprintf(b, sizeof(b), "%02d:%02d:00", h, m); return std::string(b);
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: indietro"
+    internal: true
+    page_id: pagina_sveglia
+    x_min: 0
+    x_max: 479
+    y_min: 430
+    y_max: 479
+    on_press:
+      - display.page.show: pagina_menu
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+      - component.update: lcd
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: spegni"
+    internal: true
+    page_id: pagina_sveglia_suona
+    x_min: 30
+    x_max: 230
+    y_min: 300
+    y_max: 440
+    on_press:
+      - script.execute: {id: lampo, n: 35}
+      - homeassistant.event:
+          event: esphome.banco_pannello
+          data:
+            pannello: "${nome}"
+            pe: "${pe_associato}"
+            azione: sveglia_spegni
+      - delay: 250ms
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+      - script.execute: sveglia
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Sveglia: tra 10 minuti"
+    internal: true
+    page_id: pagina_sveglia_suona
+    x_min: 250
+    x_max: 450
+    y_min: 300
+    y_max: 440
+    on_press:
+      - script.execute: {id: lampo, n: 36}
+      - homeassistant.event:
+          event: esphome.banco_pannello
+          data:
+            pannello: "${nome}"
+            pe: "${pe_associato}"
+            azione: sveglia_posticipa
+      - delay: 250ms
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+      - script.execute: sveglia
+  - platform: touchscreen
+    filters:
+      - lambda: 'if (x && millis() - id(cambio_ms) < 500) return {}; return x;'   # v9c
+    name: "Tocco messaggio"
+    internal: true
+    page_id: pagina_messaggio
+    x_min: 0
+    x_max: 479
+    y_min: 0
+    y_max: 479
+    on_press:
+      - lambda: 'if (!id(msg_risposta)) id(non_letto) = false;'
+      - if:
+          condition: {lambda: 'return id(msg_risposta);'}
+          then:
+            - homeassistant.event:
+                event: esphome.banco_pannello
+                data:
+                  pannello: "${nome}"
+                  pe: "${pe_associato}"
+                  azione: risposta_vista
+          else:
+            - homeassistant.event:
+                event: esphome.banco_pannello
+                data:
+                  pannello: "${nome}"
+                  pe: "${pe_associato}"
+                  azione: messaggio_letto
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+
+interval:
+  - interval: 1s                  # v8: durata della chiamata e conto alla rovescia del timer
+    then:
+      - if:
+          condition:
+            lambda: |-
+              auto pg = id(lcd).get_active_page();
+              if (id(timer_stato) == 1 && (int32_t) (id(timer_fine) - millis()) <= 0) id(timer_stato) = 0;
+              return pg == id(pagina_in_chiamata) || (pg == id(pagina_orologio) && id(timer_stato) == 1);
+          then: [component.update: lcd]
+
+http_request:                     # v9: per scaricare la copertina
+  verify_ssl: false
+  timeout: 10s
+
+image:
+  - platform: online_image          # v9
+    id: copertina
+    url: "${ha_url}/local/copertina_vuota.jpg"   # mai scaricata: l'URL vero arriva da HA
+    format: AUTO
+    type: RGB565
+    resize: 150x150
+    on_download_finished:
+      - lambda: 'id(cop_ok) = true;'
+      - if:
+          condition: {lambda: 'return id(lcd).get_active_page() == id(pagina_musica);'}
+          then: [component.update: lcd]
+    on_error:
+      - lambda: 'id(cop_ok) = false;'
+      - logger.log: "copertina: scaricamento fallito"
+
+time:
+  - platform: homeassistant
+    id: ora
+    on_time:
+      - seconds: 0
+        then:
+          - if:
+              condition: {lambda: 'return id(lcd).get_active_page() == id(pagina_orologio);'}
+              then: [component.update: lcd]
+          - script.execute: aggiorna_luce
+
+globals:
+  - {id: msg_mittente, type: std::string, initial_value: '""'}
+  - {id: msg_testo, type: std::string, initial_value: '""'}
+  - {id: chi_chiama, type: std::string, initial_value: '""'}
+  - {id: msg_risposta, type: bool, initial_value: 'false'}
+  - {id: sveglio_fino, type: uint32_t, initial_value: '0'}   # v6: fino a quando (millis) resta la luce piena dopo un tocco
+  - {id: g_ora_notte, type: int, restore_value: true, initial_value: '${ora_notte}'}     # v7: modificabili dal menu, ricordati
+  - {id: g_ora_giorno, type: int, restore_value: true, initial_value: '${ora_giorno}'}
+  - {id: g_luce_giorno, type: float, restore_value: true, initial_value: '1.0'}
+  - {id: non_letto, type: bool, initial_value: 'false'}       # v8: busta sull'orologio
+  - {id: inizio_chiamata, type: uint32_t, initial_value: '0'} # v8: per la durata a schermo
+  - {id: timer_fine, type: uint32_t, initial_value: '0'}      # v8: millis() della fine del timer
+  - {id: timer_stato, type: int, initial_value: '0'}          # v8: 0 nessuno, 1 in corso, 2 finito
+  - {id: g_lampo, type: int, initial_value: '0'}              # v8: tasto appena toccato (lampo di 200 ms)
+  - {id: cop_ok, type: bool, initial_value: 'false'}          # v9: copertina scaricata e valida
+  - {id: cambio_ms, type: uint32_t, initial_value: '0'}       # v9c: ultimo cambio pagina
+  - {id: cop_chiave, type: std::string, initial_value: '""'}  # v9: identita' della copertina (senza il token che HA cambia)
+
+script:
+  - id: aggiorna_luce             # v6: luce piena o notturna, secondo ora / pagina / tocco recente
+    mode: queued
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(oscuramento_notturno).state) return false;
+              if (id(lcd).get_active_page() != id(pagina_orologio)) return false;
+              if (millis() < id(sveglio_fino)) return false;
+              auto t = id(ora).now();
+              if (!t.is_valid()) return false;
+              return t.hour >= id(g_ora_notte) || t.hour < id(g_ora_giorno);
+          then:
+            - light.turn_on:
+                id: retro
+                brightness: ${luce_notte}
+          else:
+            - light.turn_on:
+                id: retro
+                brightness: !lambda 'return id(g_luce_giorno);'
+  - id: lampo                     # v8: il tasto toccato si illumina per 200 ms
+    mode: restart
+    parameters: {n: int}
+    then:
+      - lambda: 'id(g_lampo) = n;'
+      - component.update: lcd
+      - delay: 200ms
+      - lambda: 'id(g_lampo) = 0;'
+      - component.update: lcd
+  - id: pressione_lunga           # v7: 3 s fermi sul nome della stanza = menu
+    mode: restart
+    then:
+      - delay: 3s
+      - display.page.show: pagina_menu
+      - component.update: lcd
+      - script.execute: aggiorna_luce
+      - script.execute: {id: torna_all_orologio, secondi: 30}
+  - id: musica_cambiata           # v7: apre/chiude da sola la pagina della musica
+    mode: restart
+    then:
+      - if:
+          condition: {lambda: 'return id(lcd).get_active_page() == id(pagina_musica) || id(lcd).get_active_page() == id(pagina_menu);'}
+          then: [component.update: lcd]
+      - if:
+          condition: {lambda: 'return id(mus_stato).state == "playing" && id(lcd).get_active_page() == id(pagina_orologio);'}
+          then:
+            - display.page.show: pagina_musica
+            - component.update: lcd
+            - script.execute: aggiorna_luce
+      - if:
+          condition: {lambda: 'auto s = id(mus_stato).state; return s != "playing" && s != "paused" && id(lcd).get_active_page() == id(pagina_musica);'}
+          then:
+            - delay: 10s
+            - if:
+                condition: {lambda: 'auto s = id(mus_stato).state; return s != "playing" && s != "paused" && id(lcd).get_active_page() == id(pagina_musica);'}
+                then:
+                  - display.page.show: pagina_orologio
+                  - component.update: lcd
+                  - script.execute: aggiorna_luce
+  - id: sveglia                   # v6: un tocco di notte = 30 s di luce piena
+    mode: restart
+    then:
+      - lambda: 'id(sveglio_fino) = millis() + 30000;'
+      - script.execute: aggiorna_luce
+      - delay: 31s
+      - script.execute: aggiorna_luce
+  - id: torna_all_orologio
+    mode: restart
+    parameters: {secondi: int}
+    then:
+      - delay: !lambda 'return secondi * 1000;'
+      - script.stop: squillo
+      - switch.turn_off: cicalino
+      - display.page.show: pagina_orologio
+      - component.update: lcd
+      - script.execute: sveglia
+  - id: squillo
+    mode: restart
+    then:
+      - repeat:
+          count: 20
+          then:
+            - switch.turn_on: cicalino
+            - delay: 300ms
+            - switch.turn_off: cicalino
+            - delay: 700ms
+
+font:
+  # v5: Montserrat (era Roboto). Gli stessi id di prima, piu' font_titolo per il nome della postazione.
+  - {file: {type: gfonts, family: Montserrat, weight: 500}, id: font_grande, size: 120, glyphsets: [GF_Latin_Core]}
+  - {file: {type: gfonts, family: Montserrat, weight: 600}, id: font_grande_nome, size: 64, glyphsets: [GF_Latin_Core]}
+  - {file: {type: gfonts, family: Montserrat, weight: 500}, id: font_media, size: 40, glyphsets: [GF_Latin_Core]}
+  - {file: {type: gfonts, family: Montserrat, weight: 400}, id: font_piccola, size: 30, glyphsets: [GF_Latin_Core]}
+  - {file: {type: gfonts, family: Montserrat, weight: 600}, id: font_titolo, size: 40, glyphsets: [GF_Latin_Core]}
+  - {file: {type: gfonts, family: Montserrat, weight: 600}, id: font_bottone, size: 32, glyphsets: [GF_Latin_Core]}
+  - {file: {type: gfonts, family: Montserrat, weight: 400}, id: font_nota, size: 24, glyphsets: [GF_Latin_Core]}
+  # v5b: icona del telefono che squilla (Material Design Icons 7.4.47, solo quel glifo)
+  - file: {type: web, url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"}
+    id: icona_piccola            # v6: non disturbare (pieno / contorno)
+    size: 44
+    glyphs: ["\U000F0376", "\U000F0377", "\U000F075E", "\U000F075D", "\U000F01EE", "\U000F051B"]   # v7: + volume; v8: + busta, timer
+  - file: {type: web, url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"}
+    id: icona_mini               # v8: sveglia sull'orologio
+    size: 28
+    glyphs: ["\U000F0020"]
+  - file: {type: web, url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"}
+    id: icona_grande             # v7: precedente / pausa / play / successivo
+    size: 72
+    glyphs: ["\U000F04AE", "\U000F03E4", "\U000F040A", "\U000F04AD"]
+  - file: {type: web, url: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"}
+    id: icona_telefono
+    size: 72
+    glyphs: ["\U000F11AB", "\U000F03F6", "\U000F03F5"]   # v8: + in conversazione, riaggancia
+
+sensor:
+  # v5: temperatura della stanza, letta da HA. Con l'entita' segnaposto resta NaN e la pagina scrive «--,- °C».
+  - platform: homeassistant
+    id: temp_stanza
+    entity_id: ${sensore_temperatura}
+    internal: true
+    on_value:
+      - if:
+          condition: {lambda: 'return id(lcd).get_active_page() == id(pagina_orologio);'}
+          then: [component.update: lcd]
+  # v7: musica (lettore di Music Assistant del cubo) e diagnostica per la pagina Informazioni
+  - platform: homeassistant
+    id: mus_volume
+    entity_id: ${lettore_musica}
+    attribute: volume_level
+    internal: true
+    on_value: [script.execute: musica_cambiata]
+  - platform: homeassistant         # v8: temperatura esterna (segnaposto: «--» e la riga resta come prima)
+    id: temp_esterna
+    entity_id: ${sensore_esterno}
+    internal: true
+    on_value:
+      - if:
+          condition: {lambda: 'return id(lcd).get_active_page() == id(pagina_orologio);'}
+          then: [component.update: lcd]
+  - platform: homeassistant         # v8: timer del PE (secondi rimasti; 0 nessuno; -1 finito)
+    id: timer_pe
+    entity_id: ${sensore_timer}
+    internal: true
+    on_value:
+      - lambda: |-
+          if (std::isnan(x) || x == 0) id(timer_stato) = 0;
+          else if (x < 0) id(timer_stato) = 2;
+          else { id(timer_stato) = 1; id(timer_fine) = millis() + (uint32_t) (x * 1000); }
+      - if:
+          condition: {lambda: 'return id(lcd).get_active_page() == id(pagina_orologio);'}
+          then: [component.update: lcd]
+  - platform: wifi_signal
+    id: segnale
+    internal: true
+    update_interval: 60s
+
+text_sensor:
+  - platform: homeassistant         # v8: ora della sveglia («07:00:00»)
+    id: sveglia_ora_ha
+    entity_id: ${sveglia_ora}
+    internal: true
+    on_value: [component.update: lcd]
+  - platform: homeassistant
+    id: mus_stato
+    entity_id: ${lettore_musica}
+    internal: true
+    on_value: [script.execute: musica_cambiata]
+  - platform: homeassistant
+    id: mus_titolo
+    entity_id: ${lettore_musica}
+    attribute: media_title
+    internal: true
+    on_value: [script.execute: musica_cambiata]
+  - platform: homeassistant
+    id: mus_artista
+    entity_id: ${lettore_musica}
+    attribute: media_artist
+    internal: true
+    on_value: [script.execute: musica_cambiata]
+  - platform: homeassistant         # v9: copertina del brano (percorso del proxy di HA, o URL esterno)
+    id: mus_copertina
+    entity_id: ${lettore_musica}
+    attribute: entity_picture
+    internal: true
+    on_value:
+      - lambda: |-
+          // HA cambia il token nell'URL ogni pochi minuti: la copertina si riscarica solo se cambia la parte «cache=»
+          std::string k = x; size_t c = x.find("cache="); if (c != std::string::npos) k = x.substr(c);
+          if (x.empty() || x == "unknown" || x == "None") { id(cop_ok) = false; id(cop_chiave) = ""; }
+          else if (k != id(cop_chiave)) { id(cop_chiave) = k; id(cop_ok) = false; }
+          else return;
+      - if:
+          condition: {lambda: 'return !id(cop_chiave).empty() && !id(cop_ok);'}
+          then:
+            - online_image.set_url:
+                id: copertina
+                url: !lambda 'return x.rfind("http", 0) == 0 ? x : std::string("${ha_url}") + x;'
+      - if:
+          condition: {lambda: 'return id(lcd).get_active_page() == id(pagina_musica);'}
+          then: [component.update: lcd]
+  - platform: wifi_info
+    ip_address:
+      id: mio_ip
+      internal: true
